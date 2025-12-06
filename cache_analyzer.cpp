@@ -1,3 +1,5 @@
+#include <sched.h>
+#include <unistd.h>
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -11,396 +13,319 @@
 #include <cstdlib>
 #include <cmath>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <iomanip>
+#include <cassert>
+#include <cstdint>
 
 using namespace std;
 using namespace chrono;
 
-// Configuration constants
-const size_t PAGE_SIZE = 4096;
-const size_t BUFFER_SIZE = 128 * 1024 * 1024; // 128 MB buffer
-const size_t ITERATIONS = 10000000;           // 10 million iterations for pointer chase
-const int MEASURE_REPEATS = 15;               // Number of repeats for median calculation
-const int FALLBACK_TRIALS = 50;               // Number of trials for line size detection
-const int FALLBACK_ITERATIONS = 1000000;      // 1 million iterations per thread in line size detection method
+// Configuration constans
+const size_t PAGE_SIZE = sysconf(_SC_PAGE_SIZE);
+const size_t BUFFER_SIZE = 128 * 1024 * 1024; // Large buffer for warm-up
+const size_t ITERATIONS = 12'000'000;         // Pointer-chasing loop
 
-// Allocate aligned memory
-void* allocate_aligned(size_t alignment, size_t size) {
-    void* ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, size) != 0) {
-        cerr << "Failed to allocate aligned memory" << endl;
-        return nullptr;
-    }
-    return ptr;
+int MEASURE_REPEATS = 16;                     // Number of repeats for median calculation
+volatile uint64_t dummy_sink = 0;             // Prevent compiler from removing loads
+
+// Pin process to a single core (reduces noise)
+bool set_process_affinity(int cpu) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    return sched_setaffinity(0, sizeof(mask), &mask) == 0;
 }
 
-// Free aligned memory
-void free_aligned(void* ptr) {
-    free(ptr);
+// Avoid unwanted compiler optimizations
+template<typename T>
+inline void blackhole(T v) {
+    asm volatile("" : : "r"(v) : "memory");
 }
 
-// Prevent compiler optimization by using the pointer
-void use_pointer(const void* p) {
+template<typename T>
+inline void blackhole_ptr(T* p) {
     asm volatile("" : : "r"(p) : "memory");
 }
 
-// Calculate median of a vector of doubles
-double get_median(vector<double>& values) {
-    if (values.empty()) return 0.0;
-    sort(values.begin(), values.end());
-    size_t n = values.size();
-    if (n % 2 == 1) {
-        return values[n / 2];
-    } else {
-        return (values[n / 2 - 1] + values[n / 2]) / 2.0;
-    }
+// Allocate aligned memory for pointer chains
+void* allocate_aligned(size_t align, size_t size) {
+    void* p = nullptr;
+    if (posix_memalign(&p, align, size) != 0) return nullptr;
+    return p;
 }
 
-// Measure pointer chase latency
-double measure_pointer_chase(void** start, size_t iterations = ITERATIONS) {
-    const void* current = start;
-    auto start_time = steady_clock::now();
+// Build a random pointer cycle
+void create_random_chain(void** array, size_t count) {
+    vector<size_t> idx(count);
+    for (size_t i = 0; i < count; i++) idx[i] = i;
 
-    for (size_t i = 0; i < iterations; ++i) {
-        current = *(const void**)current;
-        // Prevent optimization
-        asm volatile("" : "+r"(current));
-    }
+    mt19937_64 rng(1234567);
+    shuffle(idx.begin(), idx.end(), rng);
 
-    auto end_time = steady_clock::now();
-    use_pointer(current);
-
-    double nanoseconds = duration_cast<duration<double, nano>>(end_time - start_time).count();
-    return nanoseconds / (double)iterations;
+    for (size_t i = 0; i < count; i++)
+        array[idx[i]] = &array[idx[(i + 1) % count]];
 }
 
-// Create random cyclic pointer chain to prevent from prefetching
-void create_random_chain(void** array, size_t size) {
-    vector<size_t> indices(size);
-    for (size_t i = 0; i < size; ++i) {
-        indices[i] = i;
+// Minimal warm-up pass through a chain
+void warmup_chain(void** start, size_t count) {
+    const void* p = start;
+    for (size_t i = 0; i < count; i++) {
+        p = *(void* const*)p;
+        asm volatile("" : "+r"(p));
     }
-
-    // Shuffle indices using Fisher-Yates algorithm
-    mt19937_64 rng(1234567); // seed
-    for (size_t i = size - 1; i > 0; --i) {
-        size_t j = rng() % (i + 1);
-        swap(indices[i], indices[j]);
-    }
-
-    // Create cyclic chain: each element points to next in shuffled order
-    for (size_t i = 0; i < size; ++i) {
-        array[indices[i]] = &array[indices[(i + 1) % size]];
-    }
+    blackhole_ptr((void*)p);
 }
 
-// Detect L1 cache size by measuring access time for different array sizes
-size_t find_l1_cache_size() {
+// Pointer-chase measurement
+double measure_chain_latency(void** start, size_t count) {
+    // Small warm-up to stabilize line fills
+    warmup_chain(start, min<size_t>(count, 8192));
+
+    const void* p = start;
+    auto t0 = steady_clock::now();
+
+    for (size_t i = 0; i < ITERATIONS; i++) {
+        p = *(void* const*)p;
+
+        // Occasional barrier to stop the optimizer
+        if ((i & 4095) == 0) asm volatile("" : : "r"(i) : "memory");
+        asm volatile("" : "+r"(p));
+    }
+
+    auto t1 = steady_clock::now();
+    blackhole_ptr((void*)p);
+    dummy_sink ^= (uint64_t)(uintptr_t)p;
+
+    double ns = duration_cast<duration<double, nano>>(t1 - t0).count();
+    return ns / ITERATIONS;
+}
+
+double median_of_vector(vector<double> v) {
+    sort(v.begin(), v.end());
+    size_t n = v.size();
+    if (n == 0) return 0;
+    if (n & 1) return v[n/2];
+    return (v[n/2 - 1] + v[n/2]) * 0.5;
+}
+
+// Line size detection: stride-based pointer chasing
+// Looks for the stride at which latency jumps noticeably.
+size_t detect_line_size() {
+    cout << "Detecting L1 line size..." << endl;
+
+    vector<size_t> stride_bytes = {4, 8, 16, 32, 64, 128, 256};
+    vector<double> times;
+
+    size_t ptr_count = 256 * 1024;
+    void **arr = (void**)allocate_aligned(PAGE_SIZE, ptr_count * sizeof(void*));
+    create_random_chain(arr, ptr_count);
+
+    for (size_t sb : stride_bytes) {
+        size_t step = max<size_t>(1, sb / sizeof(void*));
+        size_t count = ptr_count / step;
+
+        if (count < 16) { times.push_back(0); continue; }
+
+        // Build stride-based cycle
+        for (size_t i = 0; i < count; i++)
+            arr[i * step] = &arr[((i + 1) % count) * step];
+
+        // Warm-up attempts
+        for (int w = 0; w < 5; w++)
+            warmup_chain(arr, min<size_t>(count, 32768));
+
+        vector<double> reps;
+        for (int r = 0; r < MEASURE_REPEATS; r++)
+            reps.push_back(measure_chain_latency(arr, count));
+
+        double med = median_of_vector(reps);
+        cout << "Stride " << setw(4) << sb << " bytes -> "
+             << fixed << setprecision(6) << med << " ns\n";
+
+        times.push_back(med);
+    }
+
+    // Look for relative jumps
+    vector<double> rel(times.size(), 0.0);
+    for (size_t i = 1; i < times.size(); i++)
+        rel[i] = (times[i] - times[i-1]) / times[i-1];
+
+    double r32_64 = rel[4];
+    double r64_128 = rel[5];
+    double r128_256 = rel[6];
+
+    cout << "Rel jumps: 32->64=" << r32_64
+         << ", 64->128=" << r64_128
+         << ", 128->256=" << r128_256 << endl;
+
+    // Simple heuristic: prefer 64 unless the evidence strongly indicates otherwise
+    size_t chosen = 64;
+
+    bool big_32_64  = r32_64  > 0.12;
+    bool big_64_128 = r64_128 > 0.20;
+
+    if (big_32_64 && big_64_128) chosen = 64;
+    else if (big_32_64)         chosen = 64;
+    else if (r64_128 > 0.35)    chosen = 128;
+
+    if (chosen > 64) {
+        if (r64_128 < 2.0 * r32_64)
+            chosen = 64;
+    }
+
+    cout << "--> chosen line size = " << chosen << " bytes\n\n";
+
+    free(arr);
+    return chosen;
+}
+
+// L1 size detection using increasing working-set sizes.
+// Latency increases when the working set no longer fits L1.
+size_t detect_l1_size(size_t line_size) {
     cout << "Detecting L1 cache size..." << endl;
 
-    // Test array sizes from 1KB to 512KB (powers of two)
-    vector<size_t> sizes_kb = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512};
-    vector<double> access_times;
+    vector<size_t> sizes_kb = {
+        4,8,12,16,20,24,28,32,36,40,48,56,64,80,96,112,128
+    };
+
+    vector<double> times;
 
     for (size_t kb : sizes_kb) {
         size_t bytes = kb * 1024;
-        size_t elements = max<size_t>(4, bytes / sizeof(void*));
+        size_t count = max<size_t>(4, bytes / sizeof(void*));
 
-        void** buffer = (void**)allocate_aligned(PAGE_SIZE, max(sizeof(void*) * elements, PAGE_SIZE));
-        create_random_chain(buffer, elements);
+        void** arr = (void**)allocate_aligned(PAGE_SIZE, max(bytes, PAGE_SIZE));
+        create_random_chain(arr, count);
 
-        // Take multiple measurements
-        vector<double> measurements;
-        for (int r = 0; r < MEASURE_REPEATS; ++r) {
-            measurements.push_back(measure_pointer_chase(buffer));
+        vector<double> res;
+        res.reserve(MEASURE_REPEATS);
+        for (int r = 0; r < MEASURE_REPEATS; r++)
+            res.push_back(measure_chain_latency(arr, count));
+
+        double med = median_of_vector(res);
+        cout << kb << " KB: " << fixed << setprecision(6) << med << " ns" << endl;
+
+        times.push_back(med);
+        free(arr);
+    }
+
+    // Look for the first noticeable jump
+    for (size_t i = 1; i < times.size(); i++) {
+        if (times[i] > times[i-1] * 1.15) {
+            size_t detected = sizes_kb[i - 1] * 1024;
+            cout << "L1 size detected: " << (detected/1024) << " KB\n\n";
+            return detected;
         }
-
-        double median_time = get_median(measurements);
-        cout << kb << " KB: " << median_time << " ns" << endl;
-        access_times.push_back(median_time);
-
-        free_aligned(buffer);
     }
 
-    // Find size where access time jumps significantly (50+%)
-    size_t detected_size = 0;
-    for (size_t i = 1; i < access_times.size(); ++i) {
-        if (access_times[i] > access_times[i - 1] * 1.5) {
-            detected_size = sizes_kb[i - 1] * 1024;
-            break;
-        }
-    }
-
-    if (detected_size == 0) {
-        cout << "--> Could not detect size, using default 32 KB" << endl << endl;
-        detected_size = 32 * 1024;
-    } else {
-        cout << "L1 cache size detected: " << (detected_size / 1024) << " KB" << endl << endl;
-    }
-
-    return detected_size;
+    cout << "Fallback: L1 = 32 KB\n\n";
+    return 32 * 1024;
 }
 
-// Detect cache associativity by creating cache conflicts
-int find_cache_associativity(size_t line_size, size_t cache_size) {
-    cout << "Detecting cache associativity..." << endl;
+// Associativity detection.
+// Builds conflict sets mapped to the same index by spacing
+// elements one cache-size apart. Latency rises after #ways+1.
+int detect_associativity(size_t line_size, size_t l1_size) {
+    cout << "Detecting associativity..." << endl;
 
-    size_t step_bytes = cache_size;
-    vector<double> access_times;
+    vector<double> times;
+    int max_conflicts = 20;
 
-    // Test different numbers of conflicting addresses
-    for (int conflicts = 1; conflicts <= 16; ++conflicts) {
-        size_t needed_elements = (size_t)conflicts * (step_bytes / sizeof(void*)) + 16;
-        vector<void*> buffer(needed_elements, nullptr);
+    // Number of pointers that place successive entries in the same set
+    size_t stride_ptrs = max<size_t>(1, l1_size / sizeof(void*));
 
-        size_t stride_elements = max<size_t>(1, step_bytes / sizeof(void*));
-        vector<size_t> indices(conflicts);
-        for (int i = 0; i < conflicts; ++i) {
-            indices[i] = i * stride_elements;
-        }
+    for (int conflicts = 1; conflicts <= max_conflicts; ++conflicts) {
+        size_t needed = (size_t)conflicts * stride_ptrs + 64;
+        vector<void*> buf(needed, nullptr);
+        vector<size_t> idx(conflicts);
+        for (int i = 0; i < conflicts; ++i) idx[i] = i * stride_ptrs;
 
-        // Create random cyclic chain among conflicting elements
-        vector<size_t> permutation(conflicts);
-        for (int i = 0; i < conflicts; ++i) {
-            permutation[i] = i;
-        }
+        // Randomize access order among conflict positions
+        vector<int> perm(conflicts);
+        for (int i = 0; i < conflicts; ++i) perm[i] = i;
+        mt19937_64 rng((uint64_t)123456 + conflicts);
+        for (int i = conflicts - 1; i > 0; --i)
+            swap(perm[i], perm[rng() % (i + 1)]);
 
-        mt19937_64 rng(123456 + conflicts);
-        for (int i = conflicts - 1; i > 0; --i) {
-            size_t j = rng() % (i + 1);
-            swap(permutation[i], permutation[j]);
-        }
+        // Build the cycle over the conflict points
+        for (int i = 0; i < conflicts; ++i)
+            buf[idx[perm[i]]] = &buf[idx[perm[(i + 1) % conflicts]]];
 
-        for (int i = 0; i < conflicts; ++i) {
-            buffer[indices[permutation[i]]] = &buffer[indices[permutation[(i + 1) % conflicts]]];
-        }
+        // Fill remaining entries so everything forms a valid cycle
+        for (size_t i = 0; i < needed; ++i)
+            if (!buf[i]) buf[i] = &buf[(i + 1) % needed];
 
-        // Fill remaining pointers to complete the chain
-        for (size_t i = 0; i < needed_elements; ++i) {
-            if (buffer[i] == nullptr) {
-                buffer[i] = &buffer[(i + 1) % needed_elements];
+        // Warm-up
+        warmup_chain((void**)&buf[idx[0]], min<size_t>(needed, 65536));
+
+        // Measurement
+        vector<double> reps;
+        reps.reserve(MEASURE_REPEATS);
+        for (int r = 0; r < MEASURE_REPEATS; ++r)
+            reps.push_back(measure_chain_latency((void**)&buf[idx[0]], conflicts));
+
+        double med = median_of_vector(reps);
+        times.push_back(med);
+
+        cout << setw(2) << conflicts << " conflicts -> "
+             << fixed << setprecision(6) << med << " ns" << endl;
+    }
+
+    // Use the first few points as the baseline
+    int baseN = min<int>(3, (int)times.size());
+    double base_med = median_of_vector(vector<double>(times.begin(), times.begin() + baseN));
+
+    // Detect jump
+    for (size_t k = 1; k < times.size(); ++k) {
+        double rel = times[k] / base_med;
+        double absdiff = times[k] - base_med;
+
+        if (rel > 1.25 && absdiff > 0.5) {
+            bool stable = true;
+            if (k + 1 < times.size()) {
+                if (times[k + 1] < times[k] * 0.85)
+                    stable = false;
+            }
+            if (stable) {
+                cout << "--> associativity ≈ " << k << " ways\n\n";
+                return (int)k;
             }
         }
-
-        vector<double> measurements;
-        for (int r = 0; r < MEASURE_REPEATS; ++r) {
-            measurements.push_back(measure_pointer_chase((void**)&buffer[indices[0]]));
-        }
-
-        double median_time = get_median(measurements);
-        access_times.push_back(median_time);
-        cout << conflicts << " conflicts: " << median_time << " ns" << endl;
     }
 
-    // Calculate baseline time (first few measurements)
-    int baseline_count = min(3, (int)access_times.size());
-    vector<double> baseline_times(access_times.begin(), access_times.begin() + baseline_count);
-    double baseline_median = get_median(baseline_times);
-
-    // Find where access time increases significantly
-    for (size_t i = 1; i < access_times.size(); ++i) {
-        if (access_times[i] > baseline_median * 1.5 && access_times[i] > baseline_median + 2.0) {
-            cout << "Associativity approximately " << i << " ways" << endl;
-            return (int)i;
-        }
-    }
-
-    // Fallback with relaxed threshold
-    for (size_t i = 1; i < access_times.size(); ++i) {
-        if (access_times[i] > baseline_median * 1.35) {
-            cout << "Associativity " << i << " ways" << endl << endl;
-            return (int)i;
-        }
-    }
-
-    cout << "--> Could not detect, using default 8 ways" << endl << endl;
+    cout << "--> associativity not clear, fallback 8 ways\n\n";
     return 8;
 }
 
-// Thread barrier for synchronization
-class ThreadBarrier {
-public:
-    ThreadBarrier(size_t count) : thread_count(count) {}
-
-    void wait() {
-        unique_lock<mutex> lock(mutex_);
-        if (--thread_count == 0) {
-            condition_.notify_all();
-        } else {
-            condition_.wait(lock, [this] { return thread_count == 0; });
-        }
-    }
-
-private:
-    mutex mutex_;
-    condition_variable condition_;
-    size_t thread_count;
-};
-
-// Thread function for line size detection
-unsigned run_thread_function(ThreadBarrier& barrier, unsigned thread_id, int* element) {
-    mt19937 rng(thread_id * 1103515245u + 12345u);
-    uniform_int_distribution<int> dist(0, 4096);
-
-    barrier.wait();
-
-    int accumulator = 0;
-    for (unsigned i = 0; i < FALLBACK_ITERATIONS; ++i) {
-        *element = dist(rng);
-        accumulator ^= *element;
-    }
-
-    return (unsigned)accumulator;
-}
-
-// Run multiple threads and measure total execution time
-template<typename Func>
-double run_multithreaded_test(Func func, unsigned thread_count) {
-    ThreadBarrier barrier(thread_count + 1);
-    vector<thread> threads;
-    vector<future<unsigned>> results;
-
-    // Launch threads
-    for (unsigned t = 0; t < thread_count; ++t) {
-        packaged_task<unsigned()> task([&, t] { return func(barrier, t); });
-        results.push_back(task.get_future());
-        threads.emplace_back(move(task));
-    }
-
-    auto start_time = steady_clock::now();
-    barrier.wait(); // Start all threads simultaneously
-
-    // Wait for all threads to complete
-    for (auto& thread : threads) {
-        thread.join();
-    }
-
-    auto end_time = steady_clock::now();
-
-    // Collect results
-    unsigned combined_result = 0;
-    for (auto& result : results) {
-        combined_result += result.get();
-    }
-
-    use_pointer(&combined_result);
-
-    return duration_cast<duration<double>>(end_time - start_time).count();
-}
-
-// Test a specific line size candidate using multi-threaded false sharing test
-pair<double, double> test_line_size_candidate(size_t candidate_bytes, unsigned thread_count) {
-    size_t element_count = 64 * 1024 * 1024 / candidate_bytes;
-
-    // Two buffers: one with natural alignment, one with forced false sharing
-    vector<char> naive_buffer(element_count * candidate_bytes, 0);
-    vector<char> aligned_buffer(element_count * candidate_bytes, 0);
-
-    struct Element {
-        int* pointer;
-    };
-
-    vector<Element> naive_view(element_count);
-    vector<Element> aligned_view(element_count);
-
-    // Create arrays of pointers to elements
-    for (size_t i = 0; i < element_count; ++i) {
-        naive_view[i].pointer = reinterpret_cast<int*>(&naive_buffer[i * candidate_bytes]);
-        aligned_view[i].pointer = reinterpret_cast<int*>(&aligned_buffer[i * candidate_bytes]);
-    }
-
-    // Test function for a given view
-    auto test_view = [&](vector<Element>& view) -> double {
-        auto thread_func = [&](ThreadBarrier& barrier, unsigned thread_id) -> unsigned {
-            size_t index = view.size() / 2 + thread_id;
-            return run_thread_function(barrier, thread_id, view[index].pointer);
-        };
-
-        double total_time = 0.0;
-        for (unsigned trial = 0; trial < FALLBACK_TRIALS; ++trial) {
-            total_time += run_multithreaded_test(thread_func, thread_count);
-        }
-        return total_time / FALLBACK_TRIALS;
-    };
-
-    return make_pair(test_view(naive_view), test_view(aligned_view));
-}
-
-// Determine cache line size using false sharing detection
-size_t find_line_size_with_fallback() {
-    cout << "Detecting cache line size using false sharing test..." << endl;
-
-    vector<size_t> candidates = {16, 32, 64, 128};
-    unsigned hardware_threads = thread::hardware_concurrency();
-    if (hardware_threads == 0) hardware_threads = 4;
-    if (hardware_threads > 16) hardware_threads = 16;
-
-    struct TestResult {
-        size_t candidate;
-        double naive_time;
-        double aligned_time;
-        double ratio;
-    };
-
-    vector<TestResult> results;
-
-    // Test each candidate line size
-    for (size_t candidate : candidates) {
-        cout << "Testing " << candidate << " bytes... ";
-        auto times = test_line_size_candidate(candidate, hardware_threads);
-        double ratio = times.first / max(1e-12, times.second);
-
-        cout << "naive: " << times.first << "s, aligned: " << times.second
-             << "s, ratio: " << ratio << endl;
-
-        results.push_back({candidate, times.first, times.second, ratio});
-    }
-
-    // Select candidate with highest ratio (most false sharing effect)
-    double best_ratio = 0;
-    size_t best_candidate = 0;
-
-    for (const auto& result : results) {
-        if (result.ratio > best_ratio) {
-            best_ratio = result.ratio;
-            best_candidate = result.candidate;
-        }
-    }
-
-    cout << "Best ratio: " << best_ratio << " -> selecting " << best_candidate << " bytes" << endl << endl;
-    return best_candidate;
-}
-
 int main() {
-    cout << "L1 Cache Characteristics Detection" << endl;
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
 
-    // Allocate main buffer
-    void* buffer = allocate_aligned(PAGE_SIZE, BUFFER_SIZE);
-    if (!buffer) {
-        cerr << "Failed to allocate main buffer" << endl;
-        return 1;
-    }
+    cout << "=== L1 Cache Detection ===\n";
 
-    // Fill buffer with pattern
-    memset(buffer, 0x5A, BUFFER_SIZE);
+    // Fix CPU to reduce jitter
+    set_process_affinity(0);
 
-    // 1: Determine cache line size using false sharing test
-    size_t line_size = find_line_size_with_fallback();
+    // Initial warm-up of memory subsystem
+    void* buf = allocate_aligned(PAGE_SIZE, BUFFER_SIZE);
+    memset(buf, 0xAA, BUFFER_SIZE);
+    blackhole_ptr(buf);
 
-    // 2: Determine L1 cache size
-    size_t l1_size = find_l1_cache_size();
+    size_t line = detect_line_size();
+    size_t l1_raw = detect_l1_size(line);
+    int assoc = detect_associativity(line, l1_raw);
 
-    // 3: Determine cache associativity
-    int associativity = find_cache_associativity(line_size, l1_size);
+    // Compute number of sets
+    size_t unit = line * assoc;
+    size_t sets = (l1_raw + unit/2) / unit;
+    size_t l1_corrected = sets * unit;
 
-    // Print final results
-    cout << endl << "=====================" << endl;
-    cout << "=  Final results:  =" << endl;
-    cout << "Cache line size: " << line_size << " bytes" << endl;
-    cout << "L1 cache size: " << (l1_size / 1024) << " KB" << endl;
-    cout << "Associativity: " << associativity << " ways" << endl;
+    dummy_sink ^= (int)line ^ (int)l1_corrected ^ assoc;
 
-    // Clean up
-    free_aligned(buffer);
-
-    return 0;
+    cout << "\n===== FINAL RESULTS =====\n";
+    cout << "Line size: " << line << " bytes\n";
+    cout << "L1 size:   " << l1_corrected/1024 << " KB\n";
+    cout << "Assoc:     " << assoc << " ways\n";
+    cout << "Dummy:     " << dummy_sink << "\n";
 }
