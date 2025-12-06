@@ -95,7 +95,7 @@ double measure_chain_latency(void** start, size_t count) {
 
     auto t1 = steady_clock::now();
     blackhole_ptr((void*)p);
-    dummy_sink ^= (uint64_t)(uintptr_t)p;
+    dummy_sink = dummy_sink ^ (uint64_t)(uintptr_t)p;
 
     double ns = duration_cast<duration<double, nano>>(t1 - t0).count();
     return ns / ITERATIONS;
@@ -321,7 +321,7 @@ int main() {
     size_t sets = (l1_raw + unit/2) / unit;
     size_t l1_corrected = sets * unit;
 
-    dummy_sink ^= (int)line ^ (int)l1_corrected ^ assoc;
+    dummy_sink = dummy_sink ^ (int)line ^ (int)l1_corrected ^ assoc;
 
     cout << "\n===== FINAL RESULTS =====\n";
     cout << "Line size: " << line << " bytes\n";
